@@ -9,6 +9,7 @@ import asyncio
 import folder_paths
 from aiohttp import web
 from server import PromptServer
+from urllib.parse import urlparse
 
 # Track active downloads
 active_downloads = {}
@@ -21,6 +22,38 @@ current_download_task = None  # Only one download at a time
 # Configuration optimized for datacenter connections (RunPod)
 CHUNK_SIZE = 32 * 1024 * 1024  # 32MB chunks - balanced for 500MB to 30GB+ files
 NUM_CONNECTIONS = 8  # 8 parallel connections - optimal for DC bandwidth
+
+HF_HOST_SUFFIXES = ("huggingface.co", "hf.co")
+HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACE_HUB_TOKEN")
+
+
+def _resolve_hf_token():
+    for name in HF_TOKEN_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return None
+
+
+HF_TOKEN = _resolve_hf_token()
+
+
+def _is_hf_url(url):
+    try:
+        hostname = urlparse(url).hostname or ""
+    except Exception:
+        return False
+    hostname = hostname.lower()
+    return any(hostname.endswith(suffix) for suffix in HF_HOST_SUFFIXES)
+
+
+def _build_headers(url, extra=None):
+    headers = {}
+    if extra:
+        headers.update(extra)
+    if HF_TOKEN and _is_hf_url(url):
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+    return headers
 
 
 @PromptServer.instance.routes.post("/server_download/start")
@@ -187,7 +220,7 @@ def on_download_complete(download_id):
 
 async def download_chunk(session, url, start, end, output_path, chunk_index, download_id):
     """Download a specific chunk of the file"""
-    headers = {'Range': f'bytes={start}-{end}'}
+    headers = _build_headers(url, {'Range': f'bytes={start}-{end}'})
 
     try:
         async with session.get(url, headers=headers) as response:
@@ -367,7 +400,7 @@ async def download_file(url, output_path, download_id, token=None):
 
 async def download_chunk_with_progress(session, url, start, end, output_path, chunk_index, download_id, total_size):
     """Download chunk with progress tracking"""
-    headers = {'Range': f'bytes={start}-{end}'}
+    headers = _build_headers(url, {'Range': f'bytes={start}-{end}'})
     chunk_size = end - start + 1
     downloaded = 0
     last_report_time = 0
