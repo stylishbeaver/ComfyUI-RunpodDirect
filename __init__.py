@@ -6,6 +6,7 @@ Download models directly to your RunPod instance with multi-connection support
 import os
 import logging
 import asyncio
+import shutil
 import folder_paths
 from aiohttp import web
 from server import PromptServer
@@ -25,6 +26,8 @@ NUM_CONNECTIONS = 8  # 8 parallel connections - optimal for DC bandwidth
 
 HF_HOST_SUFFIXES = ("huggingface.co", "hf.co")
 HF_TOKEN_ENV_VARS = ("HF_TOKEN", "HUGGINGFACE_TOKEN", "HUGGINGFACE_HUB_TOKEN")
+CACHE_DIR_ENV_VARS = ("RUNPODDIRECT_CACHE_DIR", "RUNPOD_DIRECT_CACHE_DIR")
+DEFAULT_CACHE_DIR = "/root/.cache/comfyui-runpoddirect"
 
 
 def _resolve_hf_token():
@@ -36,6 +39,14 @@ def _resolve_hf_token():
 
 
 HF_TOKEN = _resolve_hf_token()
+
+
+def _resolve_cache_dir():
+    for name in CACHE_DIR_ENV_VARS:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return DEFAULT_CACHE_DIR
 
 
 def _is_hf_url(url):
@@ -54,6 +65,18 @@ def _build_headers(url, extra=None):
     if HF_TOKEN and _is_hf_url(url):
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
     return headers
+
+
+def _ensure_symlink(source: str, target: str) -> None:
+    if os.path.lexists(target):
+        if os.path.isdir(target) and not os.path.islink(target):
+            raise RuntimeError(f"Output path is a directory: {target}")
+        os.remove(target)
+    try:
+        os.symlink(source, target)
+    except OSError as e:
+        logging.warning(f"[RunpodDirect] Symlink failed, falling back to copy: {e}")
+        shutil.copy2(source, target)
 
 
 @PromptServer.instance.routes.post("/server_download/start")
@@ -106,6 +129,10 @@ async def start_download(request):
         output_dir = folder_paths.folder_names_and_paths[save_path][0][0]
         output_path = os.path.join(output_dir, safe_filename)
 
+        cache_root = _resolve_cache_dir()
+        cache_dir = os.path.join(cache_root, save_path)
+        cache_path = os.path.join(cache_dir, safe_filename)
+
         # Final security check: ensure the resolved path is within the intended directory
         output_path = os.path.abspath(output_path)
         output_dir = os.path.abspath(output_dir)
@@ -115,15 +142,19 @@ async def start_download(request):
                 status=400
             )
 
-        # Check if file already exists
-        if os.path.exists(output_path):
-            return web.json_response(
-                {"error": f"File already exists: {output_path}"},
-                status=400
-            )
+        # Check if file already exists (including symlinks)
+        if os.path.lexists(output_path):
+            if os.path.islink(output_path) and not os.path.exists(output_path):
+                os.remove(output_path)
+            else:
+                return web.json_response(
+                    {"error": f"File already exists: {output_path}"},
+                    status=400
+                )
 
-        # Create directory if it doesn't exist
+        # Create directories if they don't exist
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        os.makedirs(cache_dir, exist_ok=True)
 
         # Mark as queued
         download_id = f"{save_path}/{safe_filename}"
@@ -132,6 +163,7 @@ async def start_download(request):
             "filename": safe_filename,
             "save_path": save_path,
             "output_path": output_path,
+            "cache_path": cache_path,
             "progress": 0,
             "status": "queued",
             "priority": None
@@ -145,6 +177,7 @@ async def start_download(request):
             "download_id": download_id,
             "url": url,
             "output_path": output_path,
+            "cache_path": cache_path,
             "token": resolved_token
         })
 
@@ -183,7 +216,34 @@ async def process_download_queue():
     download_id = download_item["download_id"]
     url = download_item["url"]
     output_path = download_item["output_path"]
+    cache_path = download_item["cache_path"]
     token = download_item.get("token")
+
+    # If already cached, just link and complete
+    if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+        try:
+            _ensure_symlink(cache_path, output_path)
+            file_size = os.path.getsize(cache_path)
+            active_downloads[download_id]["status"] = "completed"
+            active_downloads[download_id]["progress"] = 100
+            active_downloads[download_id]["downloaded"] = file_size
+            active_downloads[download_id]["total"] = file_size
+
+            await PromptServer.instance.send("server_download_complete", {
+                "download_id": download_id,
+                "path": output_path,
+                "size": file_size
+            })
+        except Exception as e:
+            active_downloads[download_id]["status"] = "error"
+            active_downloads[download_id]["error"] = str(e)
+            await PromptServer.instance.send("server_download_error", {
+                "download_id": download_id,
+                "error": str(e)
+            })
+
+        asyncio.create_task(process_download_queue())
+        return
 
     # Set status to downloading
     active_downloads[download_id]["status"] = "downloading"
@@ -201,7 +261,7 @@ async def process_download_queue():
     })
 
     # Start download task
-    current_download_task = asyncio.create_task(download_file(url, output_path, download_id, token=token))
+    current_download_task = asyncio.create_task(download_file(url, cache_path, output_path, download_id, token=token))
 
     # Add completion callback to process next in queue
     current_download_task.add_done_callback(lambda t: on_download_complete(download_id))
@@ -240,7 +300,7 @@ async def download_chunk(session, url, start, end, output_path, chunk_index, dow
         return None
 
 
-async def download_file(url, output_path, download_id, token=None):
+async def download_file(url, cache_path, link_path, download_id, token=None):
     """Download file with multi-connection support and progress tracking"""
     import aiohttp
 
@@ -326,7 +386,7 @@ async def download_file(url, output_path, download_id, token=None):
             logging.info(f"File size for {download_id}: {total_size} bytes, supports range: {supports_range}")
 
             # Create file with full size
-            with open(output_path, 'wb') as f:
+            with open(cache_path, 'wb') as f:
                 f.seek(total_size - 1)
                 f.write(b'\0')
 
@@ -346,7 +406,7 @@ async def download_file(url, output_path, download_id, token=None):
                     end = start + chunk_size - 1 if i < NUM_CONNECTIONS - 1 else total_size - 1
 
                     tasks.append(download_chunk_with_progress(
-                        session, url, start, end, output_path, i, download_id, total_size
+                        session, url, start, end, cache_path, i, download_id, total_size
                     ))
 
                 # Download all chunks in parallel
@@ -360,12 +420,15 @@ async def download_file(url, output_path, download_id, token=None):
             else:
                 # Fallback to single connection download
                 logging.info(f"Using single connection for {download_id}")
-                await download_single_connection(session, url, output_path, download_id, total_size)
+                await download_single_connection(session, url, cache_path, download_id, total_size)
 
             # Check if cancelled
             if download_control[download_id]["cancelled"]:
-                os.remove(output_path)
+                if os.path.exists(cache_path):
+                    os.remove(cache_path)
                 return
+
+            _ensure_symlink(cache_path, link_path)
 
             # Mark as complete
             active_downloads[download_id]["status"] = "completed"
@@ -374,11 +437,11 @@ async def download_file(url, output_path, download_id, token=None):
             # Send completion message
             await PromptServer.instance.send("server_download_complete", {
                 "download_id": download_id,
-                "path": output_path,
+                "path": link_path,
                 "size": total_size
             })
 
-            logging.info(f"Successfully downloaded {download_id} to {output_path}")
+            logging.info(f"Successfully downloaded {download_id} to {cache_path} and linked to {link_path}")
 
             # Cleanup
             del download_control[download_id]
@@ -396,6 +459,11 @@ async def download_file(url, output_path, download_id, token=None):
         # Cleanup
         if download_id in download_control:
             del download_control[download_id]
+        if os.path.exists(cache_path):
+            try:
+                os.remove(cache_path)
+            except Exception:
+                logging.warning(f"[RunpodDirect] Failed to remove partial download {cache_path}")
 
 
 async def download_chunk_with_progress(session, url, start, end, output_path, chunk_index, download_id, total_size):
