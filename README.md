@@ -62,6 +62,31 @@ Or manually:
    - Button shows status with icons (spinner → checkmark/error)
    - Download happens in the background with multi-connection support
 
+## Fork storage and validation
+
+This fork downloads into `/root/.cache/comfyui-runpoddirect/<model-directory>/`
+and links completed files into ComfyUI's model directories. Set
+`RUNPODDIRECT_CACHE_DIR` (or `RUNPOD_DIRECT_CACHE_DIR`) to choose another cache
+directory. Temporary `.runpoddirect.part` files stay in that cache; size and
+optional SHA-256 checks must pass before a model is linked into ComfyUI.
+
+The frontend supports both the legacy missing-model dialog and the newer
+Workflow Overview/Issues missing-model panel. **Download to Pod** queues a
+server download; the native **Download** button remains a browser download.
+
+Run the local checks without a GPU or a ComfyUI installation:
+
+```bash
+uv run --with aiohttp python -m unittest discover -s tests -v
+npm install --no-save --package-lock=false jsdom
+node tests/ui-smoke.cjs
+```
+
+The Python checks use a local HTTP server to exercise queueing, ranged and
+single-connection downloads, authentication, integrity checks, cancellation,
+and cache symlinks. The DOM smoke test exercises the new side panel and the
+legacy dialog, including the server request made by **Download to Pod**.
+
 ## Security
 
 - Only allows downloads from whitelisted sources (as defined in ComfyUI's frontend)
